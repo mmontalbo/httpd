@@ -406,6 +406,19 @@ static apr_status_t h2_c2_filter_out(ap_filter_t* f, apr_bucket_brigade* bb)
         }
     }
 #endif /* AP_HAS_RESPONSE_BUCKETS */
+    /* Note when the response body completes (an EOS passes out). A c2 that
+     * finishes WITHOUT having seen an EOS (e.g. the CGI/handler timed out
+     * mid-body) produced an incomplete response and must reset the stream. */
+    if (!conn_ctx->response_eos_seen) {
+        apr_bucket *e;
+        for (e = APR_BRIGADE_FIRST(bb); e != APR_BRIGADE_SENTINEL(bb);
+             e = APR_BUCKET_NEXT(e)) {
+            if (APR_BUCKET_IS_EOS(e)) {
+                conn_ctx->response_eos_seen = 1;
+                break;
+            }
+        }
+    }
     rv = beam_out(f->c, conn_ctx, bb);
 
     ap_log_cerror(APLOG_MARK, APLOG_TRACE2, rv, f->c,
@@ -799,7 +812,20 @@ static apr_status_t c2_process(h2_conn_ctx_t *conn_ctx, conn_rec *c)
      * request pool may have been deleted. */
     r = NULL;
     if (conn_ctx->beam_out) {
-        h2_beam_close(conn_ctx->beam_out, c);
+        if (conn_ctx->has_final_response && !conn_ctx->response_eos_seen) {
+            /* A final response was started but never completed (no EOS), e.g.
+             * the CGI/handler timed out mid-body. Abort the output beam so the
+             * HTTP/2 stream is RST_STREAM'd. Otherwise s_c2_done() sees the closed
+             * beam as a complete response, sends no reset, and the client is left
+             * waiting for data/EOS that never arrive. Header-only responses
+             * (204/304/HEAD) are marked complete earlier (see the
+             * AP_STATUS_IS_HEADER_ONLY handling) so they are NOT aborted here;
+             * aborting them would re-open PR 69580. */
+            h2_beam_abort(conn_ctx->beam_out, c);
+        }
+        else {
+            h2_beam_close(conn_ctx->beam_out, c);
+        }
     }
 
     ap_log_cerror(APLOG_MARK, APLOG_TRACE1, 0, c,

@@ -1,5 +1,6 @@
 import socket
 import time
+from datetime import timedelta
 
 import pytest
 
@@ -164,3 +165,75 @@ class TestTimeout:
         piper.close()
         assert piper.response, f'{piper}'
         assert piper.response['status'] == 408, f"{piper.response}"
+
+    # A CGI that starts a response (status + headers + some body) and then goes
+    # silent past `Timeout` must lead to the HTTP/2 stream being RST_STREAM'd,
+    # not leave the client hanging. Regression test for the mod_http2 hang where
+    # a c2 that finished an *incomplete* response (no EOS, e.g. CGI timed out
+    # mid-body) was treated as complete and no reset was ever sent.
+    def test_h2_105_20(self, env):
+        conf = H2Conf(env)
+        conf.add("Timeout 1")
+        conf.add("PassEnv PATH")  # let the CGI find its interpreter
+        conf.add_vhost_cgi()
+        conf.install()
+        assert env.apache_restart() == 0
+        url = env.mkurl("https", "cgi", "/h2cgi_slow.py")
+        # Open many streams at once on ONE h2 connection. A correct server
+        # RST_STREAMs every silent CGI, so the whole batch finishes in ~Timeout.
+        # A buggy server fails to reset at least one of them (the missed reset is
+        # racy per-stream, but with many streams in flight it is reliably hit),
+        # so curl --parallel waits until its --max-time. Key on elapsed time, not
+        # exit code: --parallel makes the exit code ambiguous, and a hang here is
+        # a multi-second stall versus a sub-second clean teardown. --max-time
+        # also bounds the client so a hang cannot wedge the test.
+        #
+        # Why 10 streams: a single silent stream hangs only racily (about 80%),
+        # and the racy/deterministic knee is sharp. A sweep on a fast idle box
+        # measured 80% hang at 1 to 2 streams but 100% at 3 or more (1 and 2 are
+        # equally racy because the streams are correlated under one session
+        # connection, so it is a threshold, not an independent-probability
+        # curve). The knee rises on faster or less-loaded machines (the server
+        # wins the per-stream reset race more often), so 10 keeps a wide margin
+        # for CI hardware variance. The streams are concurrent, so the larger
+        # count costs no wall-clock, and 10 is well under the default 100 max
+        # concurrent streams.
+        count = 10
+        max_time = 10
+        r = env.curl_raw([url] * count, options=[
+            "--parallel", "--parallel-immediate", "--max-time", str(max_time)])
+        assert r.duration < timedelta(seconds=max_time - 2), \
+            f'streams hung waiting for RST_STREAM (batch took {r.duration}): {r}'
+
+    # Complement to test_h2_105_20: a body-less response that is missing an EOS
+    # must NOT be reset over HTTP/2. mod_cache revalidation of a cached,
+    # immediately-stale resource emits exactly such a 304 (EOR + Flush, no EOS).
+    # This guards the incomplete-response reset against re-opening PR 69580:
+    # only a response that began a body and is missing EOS should be
+    # reset, never a header-only one.
+    def test_h2_105_21(self, env):
+        cacheroot = f"{env.server_dir}/cacheroot"
+        env.mkpath(cacheroot)
+        conf = H2Conf(env)
+        conf.add(f"""
+            CacheRoot "{cacheroot}"
+            CacheEnable disk /
+            Header set Cache-Control "public, max-age=0"
+            """)
+        conf.add_vhost_test1()
+        conf.install()
+        assert env.apache_restart() == 0
+        url = env.mkurl("https", "test1", "/006/006.css")
+        # prime the cache (stored, immediately stale via max-age=0)
+        r = env.curl_get(url)
+        assert r.exit_code == 0, f'{r}'
+        assert r.response["status"] == 200
+        lm = r.response["header"]["last-modified"]
+        # revalidate: mod_cache freshens the stale entry and the origin returns a
+        # body-less 304. The h2 stream must close cleanly; a regression shows up
+        # as a curl exit (92, "stream not closed cleanly"), not as a 304.
+        for _ in range(5):
+            r = env.curl_get(url, options=["-H", "Cache-Control: max-age=0",
+                                           "-H", f"if-modified-since: {lm}"])
+            assert r.exit_code == 0, f'304 stream was reset (curl {r.exit_code}): {r}'
+            assert r.response["status"] == 304, f'{r.response}'
