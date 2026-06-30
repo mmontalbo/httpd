@@ -166,7 +166,55 @@ class TestTimeout:
         assert piper.response, f'{piper}'
         assert piper.response['status'] == 408, f"{piper.response}"
 
-    # A body-less response that is missing an EOS
+    # A CGI that starts a response (status + headers + some body) and then goes
+    # silent past `Timeout` must lead to the HTTP/2 stream being RST_STREAM'd,
+    # not leave the client hanging. Regression test for the mod_http2 hang where
+    # a c2 that finished an *incomplete* response (no EOS, e.g. CGI timed out
+    # mid-body) was treated as complete and no reset was ever sent.
+    def test_h2_105_20(self, env):
+        conf = H2Conf(env)
+        conf.add("Timeout 1")
+        conf.add("PassEnv PATH")  # let the CGI find its interpreter
+        conf.add_vhost_cgi()
+        conf.install()
+        assert env.apache_restart() == 0
+        url = env.mkurl("https", "cgi", "/h2cgi_slow.py")
+        # Open many streams at once on ONE h2 connection. A correct server
+        # RST_STREAMs every silent CGI, so the whole batch finishes in ~Timeout.
+        # A buggy server fails to reset at least one of them (the missed reset is
+        # racy per-stream, but with many streams in flight it is reliably hit),
+        # so curl --parallel waits until its --max-time. Key on elapsed time, not
+        # exit code: --parallel makes the exit code ambiguous, and a hang here is
+        # a multi-second stall versus a sub-second clean teardown. --max-time
+        # also bounds the client so a hang cannot wedge the test.
+        #
+        # Why 10 streams: a single silent stream hangs only racily (about 80%),
+        # and the racy/deterministic knee is sharp. A sweep on a fast idle box
+        # measured 80% hang at 1 to 2 streams but 100% at 3 or more (1 and 2 are
+        # equally racy because the streams are correlated under one session
+        # connection, so it is a threshold, not an independent-probability
+        # curve). The knee rises on faster or less-loaded machines (the server
+        # wins the per-stream reset race more often), so 10 keeps a wide margin
+        # for CI hardware variance. The streams are concurrent, so the larger
+        # count costs no wall-clock, and 10 is well under the default 100 max
+        # concurrent streams.
+        count = 10
+        max_time = 10
+        r = env.curl_raw([url] * count, options=[
+            "--parallel", "--parallel-immediate", "--max-time", str(max_time)])
+        assert r.duration < timedelta(seconds=max_time - 2), \
+            f'streams hung waiting for RST_STREAM (batch took {r.duration}): {r}'
+        # Resetting each silent CGI is logged as a CGI timeout (cgid) and the
+        # failed body read that follows it (core); both are expected here.
+        time.sleep(1)  # let the log flush
+        env.httpd_error_log.ignore_recent(
+            lognos = [
+                "AH01220",  # cgid: Timeout waiting for output from CGI script
+                "AH00574",  # core: ap_content_length_filter, apr_bucket_read() failed
+            ]
+        )
+
+    # Complement to test_h2_105_20: a body-less response that is missing an EOS
     # must NOT be reset over HTTP/2. mod_cache revalidation of a cached,
     # immediately-stale resource emits exactly such a 304 (EOR + Flush, no EOS).
     # This guards the incomplete-response reset against re-opening PR 69580:
