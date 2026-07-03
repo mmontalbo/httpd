@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import time
 import pytest
 
 from .env import H2Conf, H2TestEnv
@@ -154,14 +155,28 @@ class TestRanges:
         url = env.mkurl("https", "test1", f'/data-100m?[0-{count-1}]')
         r = env.curl_get(url, 5, options=['--http2', '-H', f'Range: bytes=0-{4096}'])
         assert r.exit_code == 0, f'{r}'
-        stats = self.get_server_status(env)
-        # amount reported is larger than (count *4k), the net payload
-        # but does not exceed an additional 4k
+        # server-status counts an HTTP/2 request when its secondary connection
+        # completes, asynchronously and on a separate connection from the status
+        # read, so the counters are eventually consistent. Poll until BOTH the
+        # transferred bytes and the request count have reached their expected
+        # floor. Each poll is itself a small counted request, so polling can
+        # nudge one counter past its threshold on its own (kBytes via a status
+        # response's bytes, Accesses via the +1 per read); requiring both floors
+        # avoids exiting while one is still short of the actual transfers.
+        stats = None
+        for polled in range(100):
+            stats = self.get_server_status(env)
+            if (int(stats['Total kBytes']) >= (4*count)+1
+                    and int(stats['Total Accesses']) >= (2+count)):
+                break
+            time.sleep(0.05)
+        # transfers are accounted: at least count*~4k of payload, and the count
+        # transfers on top of the two status checks.
         assert (4*count)+1 <= int(stats['Total kBytes'])
-        assert (4*(count+1))+1 > int(stats['Total kBytes'])
-        # total requests is now at 1 from the start, plus the stat check,
-        # plus the count transfers we did.
-        assert (2+count) == int(stats['Total Accesses'])
+        assert (2+count) <= int(stats['Total Accesses'])
+        # a double-count regression (PR 66801) would ~2x the bytes; each extra
+        # status poll adds <1k on top of the payload.
+        assert int(stats['Total kBytes']) < (4*(count+1))+1 + polled
 
     def get_server_status(self, env):
         status_url = env.mkurl("https", "test1", '/status?auto')

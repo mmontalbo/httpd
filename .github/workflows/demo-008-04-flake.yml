@@ -1,0 +1,120 @@
+# Red/green demonstration of the test_h2_008_04 flake and its fix.
+#
+# test_h2_008_04 asserts mod_status' Total Accesses/kBytes exactly after 10
+# HTTP/2 range transfers. Those are counted asynchronously when each stream's
+# secondary (c2) connection completes, so a status read right after the client
+# sees the last DATA frame can be short by one stream -> intermittent failure
+# (see PR 66801, which removed the old synchronous c1-side count). The fix is a
+# short settle before the single status read in test/modules/http2/
+# test_008_ranges.py.
+#
+# RED  : delete the settle line -> the race is live -> failures appear across
+#        many single-core-pinned repeats.
+# GREEN: restore the committed fix -> zero failures across the same repeats.
+#
+# The job passes only if RED reproduces the flake AND GREEN is clean.
+name: Demo - test_h2_008_04 flake + fix
+
+on:
+  workflow_dispatch:
+    inputs:
+      repeat:
+        description: "pytest --repeat count per red/green run"
+        default: "500"
+  push:
+    branches: [ "demo/008-04" ]
+
+permissions:
+  contents: read
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Mirror linux.yml's "HTTP/2 test suite" build.
+      CONFIG: --enable-mods-shared=reallyall --with-mpm=event --enable-mpms-shared=all
+      APR_VERSION: 1.7.6
+      APU_VERSION: 1.6.3
+      APU_CONFIG: --with-crypto
+      MFLAGS: -j4
+      TEST_INSTALL: "1"      # install httpd so pyhttpd's config.ini resolves
+      SKIP_TESTING: "1"      # travis_run_linux.sh: build+install, then exit before its own tests
+      NO_TEST_FRAMEWORK: "1" # 008_04 needs no perl framework
+      REPEAT: ${{ github.event.inputs.repeat || '500' }}
+    steps:
+      - name: apt refresh
+        run: sudo apt-get -o Acquire::Retries=5 update
+      - name: Install prerequisites
+        run: |
+          sudo apt-get install -o Acquire::Retries=5 -y \
+            cpanminus libtool-bin libapr1-dev libaprutil1-dev \
+            liblua5.3-dev libbrotli-dev libcurl4-openssl-dev \
+            libnghttp2-dev libjansson-dev libpcre2-dev gdb \
+            perl-doc libsasl2-dev check \
+            curl python3-pytest nghttp2-client python3-cryptography \
+            python3-requests python3-multipart python3-filelock python3-websockets
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2   # need HEAD~1 (pre-fix, racy) for the RED step
+
+      - name: Build APR / APR-util
+        run: ./test/travis_before_linux.sh
+        timeout-minutes: 15
+
+      - name: Build + install httpd
+        run: ./test/travis_run_linux.sh
+
+      - name: Build HTTP/2 test clients
+        run: (cd test/clients && make)
+
+      - name: "RED - reproduce the flake (pre-fix, racy)"
+        run: |
+          echo "::group::check out the pre-fix version (HEAD~1)"
+          git checkout HEAD~1 -- test/modules/http2/test_008_ranges.py
+          git --no-pager diff HEAD -- test/modules/http2/test_008_ranges.py | head -80
+          echo "::endgroup::"
+          set +e
+          MPM=event taskset -c 0 py.test-3 test/modules/http2/test_008_ranges.py \
+            -k 008_04 --repeat "$REPEAT" -q -p no:cacheprovider | tee red.log
+          set -e
+          fails=$(grep -oE '[0-9]+ failed' red.log | tail -1 | grep -oE '[0-9]+' || true)
+          fails=${fails:-0}
+          echo "### RED: $fails / $REPEAT failed (unpatched)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$fails" -gt 0 ]; then
+            echo "RED ok: flake reproduced ($fails/$REPEAT failed)"
+          else
+            echo "RED inconclusive: no failure in $REPEAT reps on this runner."
+            echo "Re-run with a larger 'repeat' input (the race is a few %)."
+            exit 1
+          fi
+
+      - name: "GREEN - restore the fix, expect zero failures"
+        run: |
+          git checkout HEAD -- test/modules/http2/test_008_ranges.py
+          echo "::group::confirm the poll fix is in place"
+          grep -n 'poll until\|for polled in range' test/modules/http2/test_008_ranges.py || true
+          echo "::endgroup::"
+          set +e
+          MPM=event taskset -c 0 py.test-3 test/modules/http2/test_008_ranges.py \
+            -k 008_04 --repeat "$REPEAT" -q -p no:cacheprovider | tee green.log
+          rv=$?
+          set -e
+          fails=$(grep -oE '[0-9]+ failed' green.log | tail -1 | grep -oE '[0-9]+' || true)
+          fails=${fails:-0}
+          echo "### GREEN: $fails / $REPEAT failed (patched)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rv" -eq 0 ] && [ "$fails" -eq 0 ]; then
+            echo "GREEN ok: fix holds (0/$REPEAT failed)"
+          else
+            echo "GREEN failed: fix did not hold ($fails failed)"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: 008_04-demo-logs
+          path: |
+            red.log
+            green.log
